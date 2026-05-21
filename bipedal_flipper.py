@@ -27,6 +27,9 @@ class BipedalFlipperWrapper(gym.Wrapper):
         self.flip_completed = False
         self.landed = False
 
+        # Curriculum setting for gravity
+        self.current_gravity = -10.0  # Default gravity
+
         # Stagnation tracking (250 steps = ~5 seconds of simulation time)
         self.max_stagnation_steps = max_stagnation_steps
         self.step_counter = 0
@@ -45,8 +48,19 @@ class BipedalFlipperWrapper(gym.Wrapper):
         self.ep_reward_landing = 0.0
         self.ep_reward_ang_vel = 0.0
 
+    def set_gravity(self, new_gravity):
+        self.current_gravity = new_gravity
+
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
+        
+        # Apply the curriculum gravity
+        if hasattr(self.env.unwrapped, 'world'):
+            try:
+                self.env.unwrapped.world.gravity = (0.0, float(self.current_gravity))
+            except Exception:
+                pass
+
         self.cumulative_angle = 0.0
         self.prev_angle = obs[0]   # hull angle
         self.flip_completed = False
@@ -100,18 +114,18 @@ class BipedalFlipperWrapper(gym.Wrapper):
         elif delta_angle < -np.pi:
             delta_angle += 2 * np.pi
 
-        # In BipedalWalker, leaning forward decreases the angle (negative rotation).
-        # We invert it here so that frontflips result in POSITIVE cumulative angle and rewards.
-        delta_angle = -delta_angle
+        # In BipedalWalker, leaning backward increases the angle (positive rotation).
+        # Since we want to reward backflips, we no longer need to invert it.
+        # delta_angle = delta_angle
 
         self.cumulative_angle += delta_angle
         self.prev_angle = current_angle
 
-        # Track per-episode max rotation (most positive = most forward rotation achieved)
+        # Track per-episode max rotation (most positive = most backward rotation achieved)
         if self.cumulative_angle > self.episode_max_rotation:
             self.episode_max_rotation = self.cumulative_angle
 
-        # 1. Custom Reward: Reward for rotating forward (frontflip)
+        # 1. Custom Reward: Reward for rotating backward (backflip)
         # We replace the default forward-movement reward with a rotation reward
         # Exponentially scale up the reward as it gets closer to a full flip (2*pi)
         progress_ratio = self.cumulative_angle / (2 * np.pi)
@@ -128,10 +142,10 @@ class BipedalFlipperWrapper(gym.Wrapper):
         custom_reward = rot_rew
         self.ep_reward_rotation += rot_rew
 
-        # 2. Custom Condition: Did it complete a frontflip? (2pi radians)
-        if self.cumulative_angle >= 2 * np.pi and not self.flip_completed:
-            custom_reward += 500.0  # Massive bonus for completing the flip
-            self.ep_reward_rotation += 500.0
+        # 2. Custom Condition: Did it complete a backflip? (2pi radians)
+        if self.cumulative_angle >= 2 * np.pi:
+            custom_reward += 5000.0  # Massive bonus for completing the flip
+            self.ep_reward_rotation += 5000.0
             self.flip_completed = True
             # NOTE: We DO NOT terminate here anymore. We want it to land on its feet!
 
@@ -140,8 +154,8 @@ class BipedalFlipperWrapper(gym.Wrapper):
             # If hull is roughly upright again (modulo 2pi, roughly 0.0 radians to ground)
             # AND at least one leg touches the ground
             if abs(obs[0]) < 0.5 and (obs[8] or obs[13]):
-                custom_reward += 500.0
-                self.ep_reward_landing += 500.0
+                custom_reward += 50000.0
+                self.ep_reward_landing += 50000.0
                 self.landed = True
                 terminated = True  # Fully successful flip and landing!
 
@@ -152,38 +166,38 @@ class BipedalFlipperWrapper(gym.Wrapper):
             terminated = True # Dead is dead; it shouldn't roll on its head
 
         # 5 Boost Jump Height: Encourage the agent to jump higher by rewarding NEW peak heights
-        jump_rew = 0.0
-        try:
-            hull_y = self.env.unwrapped.hull.position.y
-            height_above_ground = max(hull_y - 1.4, 0.0)
-            if height_above_ground > self.episode_max_height:
-                # Reward difference between previous max and new max
-                jump_rew = (height_above_ground - self.episode_max_height) * 20.0
-                self.episode_max_height = height_above_ground
-        except AttributeError:
-            pass
+        #jump_rew = 0.0
+        #try:
+        #    hull_y = self.env.unwrapped.hull.position.y
+        #    height_above_ground = max(hull_y - 1.4, 0.0)
+        #    if height_above_ground > self.episode_max_height:
+        #        # Reward difference between previous max and new max
+        #        jump_rew = (height_above_ground - self.episode_max_height) * 20.0
+        #        self.episode_max_height = height_above_ground
+        #except AttributeError:
+        #    pass
             
-        custom_reward += jump_rew
-        self.ep_reward_jump += jump_rew
+        #custom_reward += jump_rew
+        #self.ep_reward_jump += jump_rew
 
         # 5 Reward using leg contact: Encourage the agent to use its legs for powerful jumps
-        leg_rew = 0.0
-        if obs[8]:  # leg1 ground contact
-            leg_rew = 0.1
-        if obs[13]: # leg2 ground contact
-            leg_rew = 0.1
+        #leg_rew = 0.0
+        #if obs[8]:  # leg1 ground contact
+        #    leg_rew = 0.1
+        #if obs[13]: # leg2 ground contact
+        #    leg_rew = 0.1
             
-        custom_reward += leg_rew
-        self.ep_reward_legs += leg_rew
+        #custom_reward += leg_rew
+        #self.ep_reward_legs += leg_rew
 
         # 6. Angular Velocity Reward: Reward for spinning fast
-        # obs[1] is hull angular velocity. Because a frontflip produces a negative angular velocity
-        # in the Box2D engine, we invert it so that faster forward spinning gives a positive value.
+        # obs[1] is hull angular velocity. Because a backflip produces a positive angular velocity
+        # in the Box2D engine, we no longer need to invert it.
         ang_vel_rew = 0.0
         if not self.flip_completed:  # Only reward spinning *during* the flip (not after landing or on the ground)
-            forward_ang_vel = -obs[1] 
-            if forward_ang_vel > 0:
-                ang_vel_rew = forward_ang_vel * 10.0  # Encourage carrying angular momentum
+            backward_ang_vel = obs[1] 
+            if backward_ang_vel > 0:
+                ang_vel_rew = backward_ang_vel * 10.0  # Encourage carrying angular momentum
                 
         custom_reward += ang_vel_rew
         self.ep_reward_ang_vel += ang_vel_rew
@@ -232,6 +246,13 @@ if __name__ == "__main__":
                 if self.render_env is None:
                     e = gym.make("BipedalWalker-v3", hardcore=False, render_mode="human")
                     self.render_env = BipedalFlipperWrapper(e)
+
+                # Sync gravity for rendering to match training gravity
+                try:
+                    current_training_gravity = self.training_env.get_attr("current_gravity")[0]
+                    self.render_env.set_gravity(current_training_gravity)
+                except Exception:
+                    pass
 
                 obs, _ = self.render_env.reset()
                 done = False
@@ -315,7 +336,45 @@ if __name__ == "__main__":
             return True
 
 
+    class GravityCurriculumCallback(BaseCallback):
+        """
+        Decreases gravity towards end_gravity when the agent successfully 
+        completes a target number of flips in a row.
+        """
+        def __init__(self, start_gravity=-4.0, end_gravity=-10.0, step_size=0.5, streak_required=5, verbose=0):
+            super().__init__(verbose)
+            self.current_gravity = start_gravity
+            self.end_gravity = end_gravity
+            self.step_size = step_size
+            self.streak_required = streak_required
+            self.current_streak = 0
+
+        def _on_step(self) -> bool:
+            for info in self.locals.get("infos", []):
+                ep = info.get("episode_metrics")
+                if ep is not None:
+                    if ep["flip_completed"]:
+                        self.current_streak += 1
+                    else:
+                        self.current_streak = 0
+
+                    if self.current_streak >= self.streak_required:
+                        # Make gravity harder (decrease it)
+                        self.current_gravity = max(self.end_gravity, self.current_gravity - self.step_size)
+                        self.current_streak = 0  # Reset streak for the next difficulty level
+            
+            # Apply to all environments using env_method
+            self.training_env.env_method("set_gravity", self.current_gravity)
+            
+            # Log to tensorboard
+            self.logger.record("curriculum/gravity", self.current_gravity)
+            self.logger.record("curriculum/current_streak", self.current_streak)
+            
+            return True
+
+
     print("Setting up vectorized environments...")
+
 
     def make_env():
         def _init():
@@ -324,7 +383,7 @@ if __name__ == "__main__":
             return e
         return _init
 
-    num_envs = 32
+    num_envs = 32 # Reduced from 32 to prevent Windows multiprocessing pipe limits (WinError 1450/109)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     print(f"Creating {num_envs} parallel environments...")
@@ -348,8 +407,9 @@ if __name__ == "__main__":
             device=device,
             learning_rate=3e-4,
             n_steps=2048,          # Steps per env before each update
-            batch_size=4096,       # Large minibatch → saturates GPU
-            n_epochs=10,           # Gradient passes over each rollout
+            # To increase it/s, n_epochs is reduced and batch_size is increased
+            batch_size=8192,       # Larger minibatch → faster updates
+            n_epochs=4,            # Fewer passes over the rollout data
             gae_lambda=0.95,       # GAE for variance reduction
             gamma=0.99,
             clip_range=0.2,
@@ -362,12 +422,13 @@ if __name__ == "__main__":
             tensorboard_log="./tb_logs",
         )
 
-    total_steps = 2_000_000   # Frontflips are hard; give it more steps
+    total_steps = 5_000_000   # Frontflips are hard; give it more steps
     print(f"Starting training for {total_steps:,} steps...")
 
-    render_cb  = RenderCallback(render_freq=10000)
+    render_cb  = RenderCallback(render_freq=50000)
     metrics_cb = FlipMetricsCallback(window=200)
-    callbacks  = CallbackList([render_cb, metrics_cb])
+    gravity_cb = GravityCurriculumCallback(start_gravity=-12.0, end_gravity=-10.0, step_size=-0.5, streak_required=5)
+    callbacks  = CallbackList([render_cb, metrics_cb, gravity_cb])
 
     print("To monitor training live, open a new terminal and run:")
     print("  tensorboard --logdir ./tb_logs")
