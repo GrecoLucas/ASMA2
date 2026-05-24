@@ -1,40 +1,94 @@
 import gymnasium as gym
 import numpy as np
-import time
+
+# BipedalWalker-v3 Observation Space (24 dimensions):
+# obs[0]  = hull angle (radians)
+# obs[1]  = hull angular velocity
+# obs[2]  = hull horizontal velocity
+# obs[3]  = hull vertical velocity
+# obs[4]  = leg1 joint1 angle
+# obs[5]  = leg1 joint1 speed
+# obs[6]  = leg1 joint2 angle
+# obs[7]  = leg1 joint2 speed
+# obs[8]  = leg1 ground contact (bool)
+# obs[9]  = leg2 joint1 angle
+# obs[10] = leg2 joint1 speed
+# obs[11] = leg2 joint2 angle
+# obs[12] = leg2 joint2 speed
+# obs[13] = leg2 ground contact (bool)
+# obs[14..23] = 10 lidar range-finder readings
+
 
 class BipedalFlipperWrapper(gym.Wrapper):
-    def __init__(self, env, max_stagnation_steps=250):
+    def __init__(self, env, max_stagnation_steps=400):
         super().__init__(env)
         self.cumulative_angle = 0.0
         self.prev_angle = 0.0
         self.flip_completed = False
-        
+        self.landed = False
+
+        # Curriculum setting for gravity
+        self.current_gravity = -10.0  # Default gravity
+
         # Stagnation tracking (250 steps = ~5 seconds of simulation time)
         self.max_stagnation_steps = max_stagnation_steps
         self.step_counter = 0
         self.last_x = 0.0
         self.last_progress_step = 0
 
+        # Per-episode metric tracking (exposed via info on episode end)
+        self.episode_max_rotation = 0.0   # Most positive cumulative angle seen
+        self.episode_max_height = 0.0     # Highest hull_y seen above baseline
+
+        # Reward accumulators
+        self.ep_reward_rotation = 0.0
+        self.ep_reward_penalty = 0.0
+        self.ep_reward_jump = 0.0
+        self.ep_reward_legs = 0.0
+        self.ep_reward_landing = 0.0
+        self.ep_reward_ang_vel = 0.0
+
+    def set_gravity(self, new_gravity):
+        self.current_gravity = new_gravity
+
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        self.cumulative_angle = 0.0
-        self.prev_angle = obs[0]  # obs[0] is the hull angle in BipedalWalker
-        self.flip_completed = False
         
+        # Apply the curriculum gravity
+        if hasattr(self.env.unwrapped, 'world'):
+            try:
+                self.env.unwrapped.world.gravity = (0.0, float(self.current_gravity))
+            except Exception:
+                pass
+
+        self.cumulative_angle = 0.0
+        self.prev_angle = obs[0]   # hull angle
+        self.flip_completed = False
+        self.landed = False
+
         self.step_counter = 0
         self.last_progress_step = 0
         try:
             self.last_x = self.env.unwrapped.hull.position.x
         except AttributeError:
-            self.last_x = 0.0  # Fallback if hull isn't initialized yet
-            
+            self.last_x = 0.0
+
+        self.episode_max_rotation = 0.0
+        self.episode_max_height = 0.0
+        self.ep_reward_rotation = 0.0
+        self.ep_reward_penalty = 0.0
+        self.ep_reward_jump = 0.0
+        self.ep_reward_legs = 0.0
+        self.ep_reward_landing = 0.0
+        self.ep_reward_ang_vel = 0.0
+
         return obs, info
 
     def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        
+        obs, base_reward, terminated, truncated, info = self.env.step(action)
+
         self.step_counter += 1
-        
+
         # Check if doing any forward progress
         try:
             current_x = self.env.unwrapped.hull.position.x
@@ -44,55 +98,143 @@ class BipedalFlipperWrapper(gym.Wrapper):
                 self.last_progress_step = self.step_counter
         except AttributeError:
             pass
-            
+
         # Terminate if stuck in the same spot for max_stagnation_steps
         stagnation_duration = self.step_counter - self.last_progress_step
         if stagnation_duration >= self.max_stagnation_steps:
             terminated = True
-            
-        current_angle = obs[0]
-        
-        # Calculate angle delta (handling potential wrapping)
+
+        # --- Angle tracking ---
+        current_angle = obs[0]          # hull angle in radians
+
         delta_angle = current_angle - self.prev_angle
-        # Adjust for wrapping between -pi and pi
-        if delta_angle > np.pi: 
+        # Wrap delta to [-pi, pi] to handle the -pi/+pi boundary
+        if delta_angle > np.pi:
             delta_angle -= 2 * np.pi
-        elif delta_angle < -np.pi: 
+        elif delta_angle < -np.pi:
             delta_angle += 2 * np.pi
-            
+
+        # In BipedalWalker, leaning backward increases the angle (positive rotation).
+        # Since we want to reward backflips, we no longer need to invert it.
+        # delta_angle = delta_angle
+
         self.cumulative_angle += delta_angle
         self.prev_angle = current_angle
 
-        # 1. Custom Reward: Reward for rotating backwards (backflip)
-        # We replace the default forward-movement reward with a rotation reward
-        custom_reward = -delta_angle * 10.0  # Positive reward for rotating backward
-        
-        # 2. Custom Condition: Did it complete a backflip? (-2pi radians)
-        if self.cumulative_angle <= -2 * np.pi and not self.flip_completed:
-            custom_reward += 100.0  # Big bonus for completing the flip
-            self.flip_completed = True
-            terminated = True # End the episode successfully
-            
-        # 3. Handle falling: The base env sets reward to -100 if it falls.
-        if reward == -100: 
-            if self.flip_completed:
-                custom_reward = 0  # Ignore fall penalty if flip was done
-            else:
-                custom_reward -= 50 # Lighter penalty while learning
+        # Track per-episode max rotation (most positive = most backward rotation achieved)
+        if self.cumulative_angle > self.episode_max_rotation:
+            self.episode_max_rotation = self.cumulative_angle
 
-        # Optional: penalyze large motor torques
-        custom_reward -= sum(abs(action)) * 0.01
+        # 1. Custom Reward: Reward for rotating backward (backflip)
+        # We replace the default forward-movement reward with a rotation reward
+        # Exponentially scale up the reward as it gets closer to a full flip (2*pi)
+        progress_ratio = self.cumulative_angle / (2 * np.pi)
+        
+        # Base reward for rotating
+        rot_rew = delta_angle * 10.0  
+        
+        # HUGE continuous shaping reward for getting closer to the goal
+        if delta_angle > 0:
+            # Multiplier increases from 1x to ~10x as it nears a full flip
+            multiplier = 1.0 + (progress_ratio * 10.0)
+            rot_rew *= multiplier
+
+        custom_reward = rot_rew
+        self.ep_reward_rotation += rot_rew
+
+        # 2. Custom Condition: Did it complete a backflip? (2pi radians)
+        if self.cumulative_angle >= 2 * np.pi:
+            custom_reward += 5000.0  # Massive bonus for completing the flip
+            self.ep_reward_rotation += 5000.0
+            self.flip_completed = True
+            # NOTE: We DO NOT terminate here anymore. We want it to land on its feet!
+
+        # 3. Custom Condition: Reward landing safely after the flip
+        if self.flip_completed and not self.landed:
+            # If hull is roughly upright again (modulo 2pi, roughly 0.0 radians to ground)
+            # AND at least one leg touches the ground
+            if abs(obs[0]) < 0.5 and (obs[8] or obs[13]):
+                custom_reward += 50000.0
+                self.ep_reward_landing += 50000.0
+                self.landed = True
+                terminated = True  # Fully successful flip and landing!
+
+        # 4. Handle falling: The base env sets reward to -20 if it falls.
+        if base_reward == -20:
+            custom_reward -= 20.0  # Heavy penalty for falling, whether before or after flip completion
+            self.ep_reward_penalty -= 20.0
+            terminated = True # Dead is dead; it shouldn't roll on its head
+
+        # 5 Boost Jump Height: Encourage the agent to jump higher by rewarding NEW peak heights
+        #jump_rew = 0.0
+        #try:
+        #    hull_y = self.env.unwrapped.hull.position.y
+        #    height_above_ground = max(hull_y - 1.4, 0.0)
+        #    if height_above_ground > self.episode_max_height:
+        #        # Reward difference between previous max and new max
+        #        jump_rew = (height_above_ground - self.episode_max_height) * 20.0
+        #        self.episode_max_height = height_above_ground
+        #except AttributeError:
+        #    pass
+            
+        #custom_reward += jump_rew
+        #self.ep_reward_jump += jump_rew
+
+        # 5 Reward using leg contact: Encourage the agent to use its legs for powerful jumps
+        #leg_rew = 0.0
+        #if obs[8]:  # leg1 ground contact
+        #    leg_rew = 0.1
+        #if obs[13]: # leg2 ground contact
+        #    leg_rew = 0.1
+            
+        #custom_reward += leg_rew
+        #self.ep_reward_legs += leg_rew
+
+        # 6. Angular Velocity Reward: Reward for spinning fast
+        # obs[1] is hull angular velocity. Because a backflip produces a positive angular velocity
+        # in the Box2D engine, we no longer need to invert it.
+        ang_vel_rew = 0.0
+        if not self.flip_completed:  # Only reward spinning *during* the flip (not after landing or on the ground)
+            backward_ang_vel = obs[1] 
+            if backward_ang_vel > 0:
+                ang_vel_rew = backward_ang_vel * 10.0  # Encourage carrying angular momentum
+                
+        custom_reward += ang_vel_rew
+        self.ep_reward_ang_vel += ang_vel_rew
+
+        # Optional: penalize large motor torques
+        #custom_reward -= sum(abs(action)) * 0.01
+
+        # On episode end, surface episode-level metrics in info for the callback to read
+        if terminated or truncated:
+            info["episode_metrics"] = {
+                "flip_completed": float(self.flip_completed),
+                "landed": float(self.landed),
+                "max_rotation_rad": self.episode_max_rotation,
+                "max_rotation_deg": np.degrees(self.episode_max_rotation),
+                "max_rotation_pct": self.episode_max_rotation / (2 * np.pi) * 100,  # % of full flip
+                "max_height": self.episode_max_height,
+                "episode_length": self.step_counter,
+                "reward_rotation": self.ep_reward_rotation,
+                "reward_penalty": self.ep_reward_penalty,
+                "reward_jump": self.ep_reward_jump,
+                "reward_legs": self.ep_reward_legs,
+                "reward_landing": self.ep_reward_landing,
+                "reward_ang_vel": self.ep_reward_ang_vel,
+            }
 
         return obs, custom_reward, terminated, truncated, info
 
+
 if __name__ == "__main__":
     import os
-    from stable_baselines3 import SAC
+    import torch
+    from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import SubprocVecEnv
-    from stable_baselines3.common.callbacks import BaseCallback
+    from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 
     class RenderCallback(BaseCallback):
-        """Custom callback to occasionally pop open a window and show how the agent is doing."""
+        """Periodically pauses training to render the current policy for visual inspection."""
         def __init__(self, render_freq: int, verbose=0):
             super().__init__(verbose)
             self.render_freq = render_freq
@@ -100,74 +242,202 @@ if __name__ == "__main__":
 
         def _on_step(self) -> bool:
             if self.num_timesteps > 0 and self.num_timesteps % self.render_freq == 0:
-                print(f"\n--- [Step {self.num_timesteps}] Pausing parallel training to demonstrate current policy ---")
+                print(f"\n--- [Step {self.num_timesteps}] Pausing to demonstrate current policy ---")
                 if self.render_env is None:
-                    # We create a single standard environment with human rendering enabled
                     e = gym.make("BipedalWalker-v3", hardcore=False, render_mode="human")
                     self.render_env = BipedalFlipperWrapper(e)
-                
+
+                # Sync gravity for rendering to match training gravity
+                try:
+                    current_training_gravity = self.training_env.get_attr("current_gravity")[0]
+                    self.render_env.set_gravity(current_training_gravity)
+                except Exception:
+                    pass
+
                 obs, _ = self.render_env.reset()
                 done = False
                 while not done:
-                    # Always use deterministic=True for evaluation
                     action, _ = self.model.predict(obs, deterministic=True)
                     obs, _, terminated, truncated, _ = self.render_env.step(action)
                     done = terminated or truncated
-                
-                print("--- Demonstration over. Resuming high-speed training ---\n")
+
+                print("--- Demonstration over. Resuming training ---\n")
             return True
 
-    print("Setting up vectorized environments for training...")
-    
-    # Factory function to create isolated instances of our custom environment
+    class FlipMetricsCallback(BaseCallback):
+        """
+        Reads per-episode metrics from the wrapper's info dict and logs them
+        to TensorBoard under the 'flip/' prefix. This gives live graphs of:
+          - flip/success_rate         : fraction of episodes that completed the flip
+          - flip/max_rotation_pct     : how far toward a full flip the agent got (%)
+          - flip/max_rotation_deg     : same, in degrees
+          - flip/max_height           : peak height above ground
+          - flip/episode_length       : steps taken per episode
+        All values are averaged over the last `window` completed episodes.
+        """
+        def __init__(self, window: int = 100, verbose=0):
+            super().__init__(verbose)
+            self.window = window
+            # Circular buffers — one entry per completed episode
+            self._flip_success: list[float] = []
+            self._landed_success: list[float] = []
+            self._max_rotation_pct: list[float] = []
+            self._max_rotation_deg: list[float] = []
+            self._max_height: list[float] = []
+            self._ep_length: list[float] = []
+            self._rew_rotation: list[float] = []
+            self._rew_penalty: list[float] = []
+            self._rew_jump: list[float] = []
+            self._rew_legs: list[float] = []
+            self._rew_landing: list[float] = []
+            self._rew_ang_vel: list[float] = []
+
+        def _on_step(self) -> bool:
+            # self.locals["infos"] is a list with one entry per parallel env
+            for info in self.locals.get("infos", []):
+                ep = info.get("episode_metrics")
+                if ep is None:
+                    continue
+                self._flip_success.append(ep["flip_completed"])
+                self._landed_success.append(ep["landed"])
+                self._max_rotation_pct.append(ep["max_rotation_pct"])
+                self._max_rotation_deg.append(ep["max_rotation_deg"])
+                self._max_height.append(ep["max_height"])
+                self._ep_length.append(ep["episode_length"])
+                self._rew_rotation.append(ep["reward_rotation"])
+                self._rew_penalty.append(ep["reward_penalty"])
+                self._rew_jump.append(ep["reward_jump"])
+                self._rew_legs.append(ep["reward_legs"])
+                self._rew_landing.append(ep["reward_landing"])
+                self._rew_ang_vel.append(ep["reward_ang_vel"])
+
+                # Keep only the last `window` episodes
+                for buf in (self._flip_success, self._landed_success, self._max_rotation_pct,
+                            self._max_rotation_deg, self._max_height, self._ep_length,
+                            self._rew_rotation, self._rew_penalty, self._rew_jump,
+                            self._rew_legs, self._rew_landing, self._rew_ang_vel):
+                    if len(buf) > self.window:
+                        buf.pop(0)
+
+            # Log rolling averages every step (TensorBoard will smooth them anyway)
+            if self._flip_success:
+                self.logger.record("flip/success_rate",     np.mean(self._flip_success))
+                self.logger.record("flip/landed_rate",      np.mean(self._landed_success))
+                self.logger.record("flip/max_rotation_pct", np.mean(self._max_rotation_pct))
+                self.logger.record("flip/max_rotation_deg", np.mean(self._max_rotation_deg))
+                self.logger.record("flip/max_height",       np.mean(self._max_height))
+                self.logger.record("flip/episode_length",   np.mean(self._ep_length))
+                self.logger.record("flip_rewards/rotation", np.mean(self._rew_rotation))
+                self.logger.record("flip_rewards/penalty",  np.mean(self._rew_penalty))
+                self.logger.record("flip_rewards/jump",     np.mean(self._rew_jump))
+                self.logger.record("flip_rewards/legs",     np.mean(self._rew_legs))
+                self.logger.record("flip_rewards/landing",  np.mean(self._rew_landing))
+                self.logger.record("flip_rewards/ang_vel",  np.mean(self._rew_ang_vel))
+            return True
+
+
+    class GravityCurriculumCallback(BaseCallback):
+        """
+        Decreases gravity towards end_gravity when the agent successfully 
+        completes a target number of flips in a row.
+        """
+        def __init__(self, start_gravity=-4.0, end_gravity=-10.0, step_size=0.5, streak_required=5, verbose=0):
+            super().__init__(verbose)
+            self.current_gravity = start_gravity
+            self.end_gravity = end_gravity
+            self.step_size = step_size
+            self.streak_required = streak_required
+            self.current_streak = 0
+
+        def _on_step(self) -> bool:
+            for info in self.locals.get("infos", []):
+                ep = info.get("episode_metrics")
+                if ep is not None:
+                    if ep["flip_completed"]:
+                        self.current_streak += 1
+                    else:
+                        self.current_streak = 0
+
+                    if self.current_streak >= self.streak_required:
+                        # Make gravity harder (decrease it)
+                        self.current_gravity = max(self.end_gravity, self.current_gravity - self.step_size)
+                        self.current_streak = 0  # Reset streak for the next difficulty level
+            
+            # Apply to all environments using env_method
+            self.training_env.env_method("set_gravity", self.current_gravity)
+            
+            # Log to tensorboard
+            self.logger.record("curriculum/gravity", self.current_gravity)
+            self.logger.record("curriculum/current_streak", self.current_streak)
+            
+            return True
+
+
+    print("Setting up vectorized environments...")
+
+
     def make_env():
         def _init():
-            # Render mode is omitted to allow fast simulation during training
             e = gym.make("BipedalWalker-v3", hardcore=False)
             e = BipedalFlipperWrapper(e)
             return e
         return _init
 
-    # Number of parallel environments (matches the CPU cores for better data collection)
-    num_envs = 8
+    num_envs = 32 # Reduced from 32 to prevent Windows multiprocessing pipe limits (WinError 1450/109)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
     print(f"Creating {num_envs} parallel environments...")
-    
-    # SubprocVecEnv runs environments in separate CPU processes for true parallelism
     vec_env = SubprocVecEnv([make_env() for _ in range(num_envs)])
-    
-    model_path = "sac_bipedal_flipper.zip"
+
+    # PPO hyperparams tuned for 32 parallel envs + GPU:
+    #   n_steps=2048 → rollout buffer = 32 * 2048 = 65,536 transitions per update
+    #   batch_size=4096 → large GPU minibatches for high throughput
+    #   ent_coef=0.01 → encourage exploration for a hard acrobatic task
+    model_path = "ppo_bipedal_flipper.zip"
     if os.path.exists(model_path):
-        print(f"Loading existing model from {model_path} to continue training...")
-        # Load the model and pass the environment so it can continue training
-        model = SAC.load(model_path, env=vec_env, device="cuda")
+        print(f"Loading existing model from {model_path}...")
+        model = PPO.load(model_path, env=vec_env, device=device,
+                         tensorboard_log="./tb_logs")
     else:
-        # Initialize a new Soft Actor-Critic (SAC) model, explicitly targeting the GPU
-        print("Initializing new SAC model on GPU...")
-        model = SAC("MlpPolicy", vec_env, verbose=1, device="cuda")
-    
-    # Train for a specified number of steps (increased since we gather data much faster now)
-    total_steps = 20000
-    print(f"Starting training for {total_steps} steps...")
-    
-    # Create the callback to show the agent on-screen every 50,000 steps
-    # We only visualize periodically because rendering every step destroys performance. 
-    eval_callback = RenderCallback(render_freq=1000)
-    
-    # Stable Baselines 3 supports a built-in progress bar (requires rich/tqdm)
-    model.learn(total_timesteps=total_steps, callback=eval_callback, progress_bar=True)
-    
+        print(f"Initializing new PPO model on {device}...")
+        model = PPO(
+            "MlpPolicy",
+            vec_env,
+            verbose=1,
+            device=device,
+            learning_rate=3e-4,
+            n_steps=2048,          # Steps per env before each update
+            # To increase it/s, n_epochs is reduced and batch_size is increased
+            batch_size=8192,       # Larger minibatch → faster updates
+            n_epochs=4,            # Fewer passes over the rollout data
+            gae_lambda=0.95,       # GAE for variance reduction
+            gamma=0.99,
+            clip_range=0.2,
+            ent_coef=0.1,         # Entropy bonus — critical for exploration
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            policy_kwargs=dict(
+                net_arch=dict(pi=[256, 256], vf=[256, 256])  # Larger nets for GPU
+            ),
+            tensorboard_log="./tb_logs",
+        )
+
+    total_steps = 5_000_000   # Frontflips are hard; give it more steps
+    print(f"Starting training for {total_steps:,} steps...")
+
+    render_cb  = RenderCallback(render_freq=50000)
+    metrics_cb = FlipMetricsCallback(window=200)
+    gravity_cb = GravityCurriculumCallback(start_gravity=-12.0, end_gravity=-10.0, step_size=-0.5, streak_required=5)
+    callbacks  = CallbackList([render_cb, metrics_cb, gravity_cb])
+
+    print("To monitor training live, open a new terminal and run:")
+    print("  tensorboard --logdir ./tb_logs")
+    print("Then open http://localhost:6006 in your browser.\n")
+
+    model.learn(total_timesteps=total_steps, callback=callbacks, progress_bar=True)
+
     print("Training finished! Saving model...")
-    model.save("sac_bipedal_flipper")
-    
+    model.save("ppo_bipedal_flipper")
     vec_env.close()
 
-    #(Optional) Uncomment below to see the trained agent in action:
-    #print("Testing trained agent...")
-    #test_env = gym.make("BipedalWalker-v3", hardcore=False, render_mode="human")
-    #test_env = BipedalFlipperWrapper(test_env)
-    #obs, info = test_env.reset()
-    #while True:
-    #    action, _states = model.predict(obs, deterministic=True)
-    #    obs, reward, terminated, truncated, info = env.step(action)
-    #     if terminated or truncated:
-    #        obs, info = env.reset()
+    # To test after training, run: python test_model.py
