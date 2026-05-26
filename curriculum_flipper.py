@@ -221,6 +221,11 @@ class CurriculumFlipperWrapper(gym.Wrapper):
 
             # ── Stage 4 post-flip in-air shaping ───────────────────────
             if self.stage == 4 and in_air:
+                # Reset stability window if airborne mid-window
+                if self.stable_steps > 0:
+                    custom_reward -= 30.0   # penalty for breaking stability
+                    self.stable_steps = 0
+
                 # a) Hip-down posture: reward hips angled to point legs toward ground.
                 #    obs[4] = joint[0].angle (hip 1), obs[9] = joint[2].angle (hip 2)
                 #    Positive hip angle means leg sweeps forward/down in landing pose.
@@ -233,7 +238,6 @@ class CurriculumFlipperWrapper(gym.Wrapper):
 
                 # b) Leg extension reward: discourage tucked knees during descent.
                 #    knee_angle ≈ 0 → extended, ≈ 2 → fully tucked.
-                #    Reward for LOW knee angle (legs straight, ready to absorb impact).
                 extension = 4.0 - (knee1_angle + knee2_angle)  # max=4 when fully extended
                 custom_reward += extension * 2.0
 
@@ -248,55 +252,51 @@ class CurriculumFlipperWrapper(gym.Wrapper):
                 self.stable_steps = 0   # reset stability counter on crash
                 terminated = True   # treat as failure, reset and retry
 
-            # 5. CLEAN LANDING BONUS: feet touch AND hull is upright
+            # 5. CLEAN LANDING / STABILITY WINDOW: feet touch AND hull is upright
             elif feet_contact and abs(hull_angle) < clean_angle:
-                # Stage 4: require BOTH feet simultaneously for maximum precision
-                landing_feet_ok = both_feet if self.stage == 4 else feet_contact
-
-                if landing_feet_ok:
+                if self.stage <= 2:
+                    # Immediate bonus for stages 1-2
                     uprightness = 1.0 - (abs(hull_angle) / clean_angle)
+                    landing_bonus = 1000.0
+                    custom_reward += landing_bonus * uprightness
+                    self.landed = True
+                    terminated  = True
 
-                    if self.stage <= 2:
-                        # Immediate bonus for stages 1-2
-                        landing_bonus = 1000.0
-                        custom_reward += landing_bonus * uprightness
-                        self.landed = True
-                        terminated  = True
+                elif self.stage == 3:
+                    # Immediate bonus for stage 3
+                    uprightness = 1.0 - (abs(hull_angle) / clean_angle)
+                    landing_bonus = 2000.0
+                    custom_reward += landing_bonus * uprightness
+                    self.landed = True
+                    terminated  = True
 
-                    elif self.stage == 3:
-                        # Immediate bonus for stage 3
-                        landing_bonus = 2000.0
-                        custom_reward += landing_bonus * uprightness
-                        self.landed = True
-                        terminated  = True
+                else: # self.stage == 4
+                    # ── Stage 4: STABILITY WINDOW ──────────────────────────
+                    # Agent must hold at least one foot contact + upright for STABILITY_STEPS
+                    # consecutive steps. At the end, both feet must be touching.
+                    self.stable_steps += 1
 
-                    else:
-                        # ── Stage 4: STABILITY WINDOW ──────────────────────────
-                        # Agent must hold both-feet + upright for STABILITY_STEPS
-                        # consecutive steps before the bonus is awarded.
-                        # This prevents farming the instant-contact exploit.
-                        self.stable_steps += 1
+                    uprightness = 1.0 - (abs(hull_angle) / clean_angle)
+                    # Per-step reward for holding the pose
+                    custom_reward += uprightness * 15.0
 
-                        # Per-step reward for holding the pose
-                        custom_reward += uprightness * 15.0
+                    # Must have stable steps AND both feet touching to successfully complete
+                    if self.stable_steps >= self.STABILITY_STEPS and both_feet:
+                        # Held it long enough — award the full bonus
+                        vel_y = obs[3]  # normalised vertical vel (neg = falling)
+                        impact_penalty = max(0.0, -vel_y) * 50.0
+                        custom_reward -= impact_penalty
+                        custom_reward += 3000.0 * uprightness
+                        self.landed   = True
+                        terminated    = True   # success!
 
-                        if self.stable_steps >= self.STABILITY_STEPS:
-                            # Held it long enough — award the full bonus
-                            vel_y = obs[3]  # normalised vertical vel (neg = falling)
-                            impact_penalty = max(0.0, -vel_y) * 50.0
-                            custom_reward -= impact_penalty
-                            custom_reward += 3000.0 * uprightness
-                            self.landed   = True
-                            terminated    = True   # success!
-
-                elif self.stage == 4:
-                    # Pose broken during stability window — penalise and reset counter
-                    if self.stable_steps > 0:
-                        custom_reward -= 30.0   # breaking out of pose is bad
-                        self.stable_steps = 0
-                    elif not both_feet:
-                        # One foot only, stability window not yet started
-                        custom_reward -= 20.0
+            # 6. BREAKING STABILITY / RESET (Stage 4 only)
+            elif self.stage == 4:
+                # If we have feet contact but hull angle is not clean (and not crashed),
+                # reset stability. (Airborne resets are handled above in the in_air block)
+                if self.stable_steps > 0:
+                    custom_reward -= 30.0
+                    self.stable_steps = 0
 
         # ════════════════════════════════════════════════════════════════
         # STAGE-SPECIFIC extras
