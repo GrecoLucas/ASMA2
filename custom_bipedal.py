@@ -30,15 +30,15 @@ FPS = 50
 SCALE = 30.0  # affects how fast-paced the game is, forces should be adjusted as well
 
 MOTORS_TORQUE = 80
-SPEED_HIP = 4
-SPEED_KNEE = 6
+SPEED_HIP = 6.2
+SPEED_KNEE = 8.2
 LIDAR_RANGE = 160 / SCALE
 
 INITIAL_RANDOM = 5
 
-HULL_POLY = [(-22, +9), (+4, +9), (+24, +1), (+24, -8), (-22, -8)]
-LEG_DOWN = -8 / SCALE
-LEG_W, LEG_H = 8 / SCALE, 34 / SCALE
+HULL_POLY = [(-18, +6), (+3, +6), (+18, +1), (+18, -5), (-18, -5)]
+LEG_DOWN = -5 / SCALE
+LEG_W, LEG_H = 4 / SCALE, 30 / SCALE
 
 VIEWPORT_W = 600
 VIEWPORT_H = 400
