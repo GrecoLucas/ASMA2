@@ -57,8 +57,8 @@ class CurriculumFlipperWrapper(gym.Wrapper):
                no fall-penalty neutralisation.
 
     Stage 4  — Precision Landing (gravity = -10.0, tighter standards)
-        Goal : land cleanly on BOTH feet with legs extended and minimal
-               impact velocity, hull nearly upright.
+        Goal : land cleanly on BOTH feet with legs extended, hold the pose,
+               and actually stand — not just graze the ground for a bonus.
         Logic:
           • Clean landing requires BOTH feet simultaneously (not just one).
           • Tighter hull angle threshold: 0.25 rad (≈14°) instead of 0.4.
@@ -68,8 +68,12 @@ class CurriculumFlipperWrapper(gym.Wrapper):
             gives a penalty proportional to speed (hard crash = bad).
           • Hip-down posture reward: while airborne after flip, positive
             reward for hip joints angled to point legs toward the ground.
-          • Larger clean-landing bonus (3000) to dominate policy updates.
-          • Harsher crash penalty (-200) to strongly discourage knee-lands.
+          • STABILITY WINDOW: the agent must hold both-feet + upright pose
+            for STABILITY_STEPS (20) consecutive steps before the bonus is
+            awarded. Per-step reward during this window; penalty for breaking
+            out of it early. This closes the reward-hacking exploit where
+            the agent grazed the ground for one frame to collect the bonus.
+          • Larger clean-landing bonus (3000) and harsher crash (-200).
     """
 
     # ── Gravity per stage ──────────────────────────────────────────────────
@@ -78,9 +82,10 @@ class CurriculumFlipperWrapper(gym.Wrapper):
     # ── Landing angle thresholds (radians) ────────────────────────────────
     #   Hull angle ≈ 0  → upright
     #   Hull angle ≈ ±π → fully upside-down
-    CLEAN_LANDING_ANGLE = 0.4   # ≈ 23° off vertical → success (stages 1-3)
+    CLEAN_LANDING_ANGLE    = 0.4   # ≈ 23° off vertical → success (stages 1-3)
     CLEAN_LANDING_ANGLE_S4 = 0.25  # ≈ 14° off vertical → success (stage 4)
-    CRASH_LANDING_ANGLE = 0.8   # ≈ 46° off vertical → knee crash
+    CRASH_LANDING_ANGLE    = 0.8   # ≈ 46° off vertical → knee crash
+    STABILITY_STEPS        = 20    # steps agent must hold landing before bonus (stage 4)
 
     def __init__(self, env, stage: int = 1, max_steps: int = 1500):
         super().__init__(env)
@@ -94,6 +99,7 @@ class CurriculumFlipperWrapper(gym.Wrapper):
         self.landed           = False
         self.step_counter     = 0
         self._milestone_flags: dict = {}
+        self.stable_steps     = 0    # consecutive steps holding landing pose (stage 4)
 
         # Expand observation: append normalised flip progress [0, ∞)
         low  = np.append(self.env.observation_space.low,  -np.inf)
@@ -118,6 +124,7 @@ class CurriculumFlipperWrapper(gym.Wrapper):
         self.landed           = False
         self.step_counter     = 0
         self._milestone_flags = {}
+        self.stable_steps     = 0
 
         obs_out = np.append(obs, 0.0).astype(np.float32)
         return obs_out, info
@@ -238,6 +245,7 @@ class CurriculumFlipperWrapper(gym.Wrapper):
                 # Landing on knees / still upside-down = bad
                 crash_penalty = -100.0 if self.stage <= 2 else (-150.0 if self.stage == 3 else -200.0)
                 custom_reward += crash_penalty
+                self.stable_steps = 0   # reset stability counter on crash
                 terminated = True   # treat as failure, reset and retry
 
             # 5. CLEAN LANDING BONUS: feet touch AND hull is upright
@@ -246,27 +254,49 @@ class CurriculumFlipperWrapper(gym.Wrapper):
                 landing_feet_ok = both_feet if self.stage == 4 else feet_contact
 
                 if landing_feet_ok:
-                    # Scale the bonus with how upright the hull is
                     uprightness = 1.0 - (abs(hull_angle) / clean_angle)
 
                     if self.stage <= 2:
+                        # Immediate bonus for stages 1-2
                         landing_bonus = 1000.0
+                        custom_reward += landing_bonus * uprightness
+                        self.landed = True
+                        terminated  = True
+
                     elif self.stage == 3:
+                        # Immediate bonus for stage 3
                         landing_bonus = 2000.0
+                        custom_reward += landing_bonus * uprightness
+                        self.landed = True
+                        terminated  = True
+
                     else:
-                        # Stage 4: also penalise hard landings (high downward velocity)
-                        vel_y = obs[3]  # normalised vertical velocity (negative = falling)
-                        impact_penalty = max(0.0, -vel_y) * 50.0  # faster fall = more penalty
-                        custom_reward -= impact_penalty
-                        landing_bonus = 3000.0
+                        # ── Stage 4: STABILITY WINDOW ──────────────────────────
+                        # Agent must hold both-feet + upright for STABILITY_STEPS
+                        # consecutive steps before the bonus is awarded.
+                        # This prevents farming the instant-contact exploit.
+                        self.stable_steps += 1
 
-                    custom_reward += landing_bonus * uprightness
-                    self.landed = True
-                    terminated  = True   # success — end the episode
+                        # Per-step reward for holding the pose
+                        custom_reward += uprightness * 15.0
 
-                elif self.stage == 4 and not both_feet:
-                    # One foot only in stage 4: small penalty, keep trying
-                    custom_reward -= 20.0
+                        if self.stable_steps >= self.STABILITY_STEPS:
+                            # Held it long enough — award the full bonus
+                            vel_y = obs[3]  # normalised vertical vel (neg = falling)
+                            impact_penalty = max(0.0, -vel_y) * 50.0
+                            custom_reward -= impact_penalty
+                            custom_reward += 3000.0 * uprightness
+                            self.landed   = True
+                            terminated    = True   # success!
+
+                elif self.stage == 4:
+                    # Pose broken during stability window — penalise and reset counter
+                    if self.stable_steps > 0:
+                        custom_reward -= 30.0   # breaking out of pose is bad
+                        self.stable_steps = 0
+                    elif not both_feet:
+                        # One foot only, stability window not yet started
+                        custom_reward -= 20.0
 
         # ════════════════════════════════════════════════════════════════
         # STAGE-SPECIFIC extras
@@ -495,9 +525,9 @@ if __name__ == "__main__":
         vec_env_s4 = SubprocVecEnv([make_env(stage=4) for _ in range(NUM_ENVS)])
         model = PPO.load(f"{STAGE3_SAVE}", env=vec_env_s4, device=device,
                          tensorboard_log="./tb_logs_flipper")
-        # Very low LR: the flip is already good, we're fine-tuning landing precision
-        model.learning_rate = 3e-5
-        model.ent_coef      = 0.0005  # Minimal entropy: exploit precision
+        # Slightly higher entropy to escape the reward-hacking local optimum
+        model.learning_rate = 5e-5
+        model.ent_coef      = 0.002   # Enough exploration to find the stability window
         cbs = CallbackList([
             FlipMetricsCallback(window=200),
             RenderCallback(render_freq=100_000, stage=4),

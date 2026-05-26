@@ -30,8 +30,8 @@ FPS = 50
 SCALE = 30.0  # affects how fast-paced the game is, forces should be adjusted as well
 
 MOTORS_TORQUE = 160
-SPEED_HIP = 4
-SPEED_KNEE = 6
+SPEED_HIP = 5
+SPEED_KNEE = 7
 LIDAR_RANGE = 160 / SCALE
 
 INITIAL_RANDOM = 5
