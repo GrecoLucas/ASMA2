@@ -35,89 +35,62 @@ import numpy as np
 
 class CurriculumFlipperWrapper(gym.Wrapper):
     """
-    Four-stage curriculum wrapper that trains a BipedalWalker to perform
-    clean backflips and land feet-first.
+    5-stage curriculum wrapper for BipedalWalker backflip training.
 
-    Stage 1  — Rotation Mastery  (gravity = -5.0)
-        Goal : discover and reliably perform a full backflip.
-        Logic: fall penalty is neutralised so the agent takes risks.
-               Rewards raw angular speed, monotone rotation progress,
-               airtime, and milestone completions (90°, 180°, 270°, 360°).
+    Stage 1 — Rotation Mastery  (gravity = -5.0)
+        Learn to discover and reliably complete a full backflip.
+        Fall penalty cancelled so the agent takes risks.
 
-    Stage 2  — Landing           (gravity = -7.5)
-        Goal : land upright on feet after the flip.
-        Logic: knee-crash landings (feet touch but hull not upright) are
-               penalised and terminate the episode.
-               Clean landings (hull angle < 0.4 rad) give a big bonus.
-               Continuous uprightness reward + tuck reward guide the agent.
+    Stage 2 — Landing  (gravity = -7.5)
+        Land upright on feet after the flip.
+        Knee-crash landings penalised and terminated.
 
-    Stage 3  — Consolidation     (gravity = -10.0, real physics)
-        Goal : perform the full sequence under realistic gravity.
-        Logic: same as Stage 2 but with higher bonuses/penalties and
-               no fall-penalty neutralisation.
+    Stage 3 — Consolidation  (gravity = -10.0)
+        Same as Stage 2 under full gravity, no hand-holding.
 
-    Stage 4  — Precision Landing (gravity = -10.0, tighter standards)
-        Goal : land cleanly on BOTH feet with legs extended, hold the pose,
-               and actually stand — not just graze the ground for a bonus.
-        Logic:
-          • Clean landing requires BOTH feet simultaneously (not just one).
-          • Tighter hull angle threshold: 0.25 rad (≈14°) instead of 0.4.
-          • Post-flip descent: rewards legs pointing DOWN (hips extended,
-            low knee angle) so the agent preps a proper leg-first landing.
-          • Vertical-impact penalty: landing with high downward velocity
-            gives a penalty proportional to speed (hard crash = bad).
-          • Hip-down posture reward: while airborne after flip, positive
-            reward for hip joints angled to point legs toward the ground.
-          • STABILITY WINDOW: the agent must hold both-feet + upright pose
-            for STABILITY_STEPS (20) consecutive steps before the bonus is
-            awarded. Per-step reward during this window; penalty for breaking
-            out of it early. This closes the reward-hacking exploit where
-            the agent grazed the ground for one frame to collect the bonus.
-          • Larger clean-landing bonus (3000) and harsher crash (-200).
+    Stage 4 — Precision Landing  (gravity = -10.0, strict)
+        Fixes the Stage-3 problem where the flip completes too close
+        to the ground so the legs end up pointing forward.
+        Enforces a tighter landing angle (0.22 rad) and stability window.
+
+    Stage 5 — Landing Stabilization  (gravity = -10.0, recovery + straight legs)
+        Same as Stage 4 but removes premature knee-crash terminations to allow
+        recovery training. Also requires the legs to be straight (extended) at the
+        end of the stability window before the landing is successful.
     """
 
-    # ── Gravity per stage ──────────────────────────────────────────────────
-    GRAVITY = {1: -5.0, 2: -7.5, 3: -10.0, 4: -10.0}
-
-    # ── Landing angle thresholds (radians) ────────────────────────────────
-    #   Hull angle ≈ 0  → upright
-    #   Hull angle ≈ ±π → fully upside-down
-    CLEAN_LANDING_ANGLE    = 0.4   # ≈ 23° off vertical → success (stages 1-3)
-    CLEAN_LANDING_ANGLE_S4 = 0.25  # ≈ 14° off vertical → success (stage 4)
-    CRASH_LANDING_ANGLE    = 0.8   # ≈ 46° off vertical → knee crash
-    STABILITY_STEPS        = 20    # steps agent must hold landing before bonus (stage 4)
+    GRAVITY                = {1: -5.0, 2: -7.5, 3: -10.0, 4: -10.0, 5: -10.0}
+    CLEAN_LANDING_ANGLE    = 0.4    # ~23°  stages 1-3
+    CLEAN_LANDING_ANGLE_S4 = 0.22   # ~12.6° stage 4
+    CLEAN_LANDING_ANGLE_S5 = 0.28   # ~16°  stage 5
+    CRASH_LANDING_ANGLE    = 0.8    # ~46°  knee crash (stages 1-4)
+    CRASH_LANDING_ANGLE_S5 = 1.1    # ~63°  knee crash (stage 5)
+    STABILITY_STEPS        = 45     # steps to hold landing pose (stages 4-5)
 
     def __init__(self, env, stage: int = 1, max_steps: int = 1500):
         super().__init__(env)
-        self.stage = stage
+        self.stage     = stage
         self.max_steps = max_steps
-
-        # Per-episode state (initialised in reset)
         self.cumulative_angle = 0.0
         self.prev_angle       = 0.0
         self.flip_completed   = False
         self.landed           = False
         self.step_counter     = 0
-        self._milestone_flags: dict = {}
-        self.stable_steps     = 0    # consecutive steps holding landing pose (stage 4)
-
-        # Expand observation: append normalised flip progress [0, ∞)
+        self._milestone_flags = {}
+        self.stable_steps     = 0
+        self.max_stable_steps = 0
         low  = np.append(self.env.observation_space.low,  -np.inf)
         high = np.append(self.env.observation_space.high,  np.inf)
         self.observation_space = gym.spaces.Box(low, high, dtype=np.float32)
 
-    # ── Reset ──────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-
-        # Apply stage-dependent gravity (gets closer to real gravity each stage)
         gravity = self.GRAVITY.get(self.stage, -5.0)
         try:
             self.env.unwrapped.world.gravity = (0.0, float(gravity))
         except Exception:
             pass
-
-        # Reset all per-episode tracking
         self.cumulative_angle = 0.0
         self.prev_angle       = obs[0]
         self.flip_completed   = False
@@ -125,11 +98,10 @@ class CurriculumFlipperWrapper(gym.Wrapper):
         self.step_counter     = 0
         self._milestone_flags = {}
         self.stable_steps     = 0
+        self.max_stable_steps = 0
+        return np.append(obs, 0.0).astype(np.float32), info
 
-        obs_out = np.append(obs, 0.0).astype(np.float32)
-        return obs_out, info
-
-    # ── Step ───────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
     def step(self, action):
         obs, base_reward, terminated, truncated, info = self.env.step(action)
         self.step_counter += 1
@@ -137,208 +109,207 @@ class CurriculumFlipperWrapper(gym.Wrapper):
         # ── Angle tracking ──────────────────────────────────────────────
         current_angle = obs[0]
         delta_angle   = current_angle - self.prev_angle
-
-        # Wrap delta to [-π, π] to handle the ±π boundary
-        if delta_angle >  np.pi:
-            delta_angle -= 2 * np.pi
-        elif delta_angle < -np.pi:
-            delta_angle += 2 * np.pi
-
+        if delta_angle >  np.pi: delta_angle -= 2 * np.pi
+        if delta_angle < -np.pi: delta_angle += 2 * np.pi
         prev_cumulative        = self.cumulative_angle
         self.cumulative_angle += delta_angle
         self.prev_angle        = current_angle
-
         abs_angle = abs(self.cumulative_angle)
         abs_prev  = abs(prev_cumulative)
 
-        # ── Useful observations ─────────────────────────────────────────
-        hull_angle   = obs[0]          # ≈ 0 = upright, ±π = upside-down
-        ang_vel      = obs[1]          # hull angular velocity
-        foot1_down   = obs[8]  == 1.0  # leg 1 lower contact
-        foot2_down   = obs[13] == 1.0  # leg 2 lower contact
+        # ── Observation shorthands ──────────────────────────────────────
+        hull_angle  = obs[0]            # 0=upright, ±π=upside-down
+        ang_vel     = obs[1]            # hull angular velocity
+        vel_x       = obs[2]            # normalised horizontal velocity
+        vel_y       = obs[3]            # normalised vertical velocity (pos=up)
+        foot1_down  = obs[8]  == 1.0
+        foot2_down  = obs[13] == 1.0
         feet_contact = foot1_down or foot2_down
         both_feet    = foot1_down and foot2_down
         in_air       = not foot1_down and not foot2_down
-        is_falling   = (base_reward == -100)  # hull hit the ground
-
-        # knee joint angles (obs[6], obs[11] ≈ 0 = extended, ~2 = fully tucked)
-        knee1_angle = obs[6]
-        knee2_angle = obs[11]
+        is_falling   = (base_reward == -100)
+        knee1_angle  = obs[6]           # 0=extended, ~2=tucked
+        knee2_angle  = obs[11]
+        hip1_angle   = obs[4]           # leg 1 hip angle
+        hip2_angle   = obs[9]           # leg 2 hip angle
+        height_frac  = obs[14]          # ray-0 lidar: 0=touching ground, 1=~5.3m up
 
         custom_reward = 0.0
 
-        # ════════════════════════════════════════════════════════════════
-        # PRE-FLIP rewards (all stages, only until flip is complete)
-        # ════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════
+        # PRE-FLIP rewards
+        # ══════════════════════════════════════════════════════════════
         if not self.flip_completed:
-            # 1. Raw angular speed — spin faster!
-            custom_reward += abs(ang_vel) * 5.0
-
-            # 2. Monotone rotation progress
-            #    Using abs() means wiggling back-and-forth yields NO progress
-            rotation_progress = abs_angle - abs_prev
-            custom_reward += rotation_progress * 15.0
-
-            # 3. Airtime bonus during flip
+            custom_reward += abs(ang_vel) * 5.0               # spin faster
+            custom_reward += (abs_angle - abs_prev) * 15.0   # rotation progress
             if in_air:
-                custom_reward += 1.0
-
-            # 4. Milestone bonuses: 25%, 50%, 75% of full rotation
-            milestones = [np.pi / 2, np.pi, 3 * np.pi / 2]
-            for ms in milestones:
+                custom_reward += 1.0                          # airtime bonus
+            # HEIGHT FIX 1: reward upward velocity (stages 3+)
+            # Encourages jumping BEFORE spinning to gain altitude first.
+            if self.stage >= 3 and vel_y > 0:
+                custom_reward += vel_y * 10.0
+            for ms in [np.pi / 2, np.pi, 3 * np.pi / 2]:
                 key = f"ms_{ms:.4f}"
                 if not self._milestone_flags.get(key, False) and abs_angle >= ms:
                     self._milestone_flags[key] = True
                     custom_reward += 50.0
 
-        # ════════════════════════════════════════════════════════════════
-        # FLIP COMPLETION (2π = one full rotation)
-        # ════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════
+        # FLIP COMPLETION (full 2π rotation)
+        # ══════════════════════════════════════════════════════════════
         if abs_angle >= 2 * np.pi and not self.flip_completed:
             self.flip_completed = True
             custom_reward += 300.0
+            # HEIGHT FIX 2: large altitude bonus at flip completion (stages 3+)
+            # obs[14]=straight-down lidar fraction: 0=ground, 1=~5.3m above.
+            # Higher flip completion → more room for legs to extend downward.
+            if self.stage >= 3:
+                custom_reward += height_frac * 200.0
 
-        # ════════════════════════════════════════════════════════════════
-        # POST-FLIP rewards (all stages, once flip_completed)
-        # ════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════
+        # POST-FLIP rewards (flip done, waiting to land)
+        # ══════════════════════════════════════════════════════════════
         if self.flip_completed and not self.landed:
 
-            # 1. Strong continuous uprightness reward
-            #    cos(0) = 1.0 (upright, max reward)
-            #    cos(π) = -1.0 (upside-down, max penalty)
-            #    This creates a smooth gradient toward standing
-            upright_rew = np.cos(hull_angle) * 25.0
-            custom_reward += upright_rew
+            # 1. Uprightness gradient
+            custom_reward += np.cos(hull_angle) * 25.0
 
-            # 2. Dampen residual spin — we want the agent to STOP rotating and land
+            # 2. Dampen residual spin
             custom_reward -= abs(ang_vel) * 5.0
 
-            # 3. In-air tuck reward: bent knees give control during descent
-            #    (Stage 4 replaces this with leg-extension reward below)
-            if in_air and self.stage < 4:
-                tuck = knee1_angle + knee2_angle  # higher = more bent
-                custom_reward += tuck * 1.5
+            # 2b. Anti-bounce: penalise vertical velocity unconditionally post-flip
+            #     This fires whether or not feet are touching, so hopping is always costly.
+            custom_reward -= abs(vel_y) * 6.0
 
-            # ── Stage 4 post-flip in-air shaping ───────────────────────
-            if self.stage == 4 and in_air:
-                # Reset stability window if airborne mid-window
-                if self.stable_steps > 0:
-                    custom_reward -= 30.0   # penalty for breaking stability
+            if in_air:
+                # 3. In-air tuck (stages 1-2 only)
+                if self.stage < 3:
+                    custom_reward += (knee1_angle + knee2_angle) * 1.5
+
+                # HEIGHT FIX 3: per-step altitude reward while airborne (stages 3+)
+                # Keeps the agent high so it has TIME to orient legs before impact.
+                if self.stage >= 3:
+                    custom_reward += height_frac * 4.0
+
+                # Stage 4/5: in-air landing prep
+                if self.stage in [4, 5]:
+                    if self.stable_steps > 0:
+                        custom_reward -= 60.0       # penalty for breaking stability (doubled)
+                        self.stable_steps = 0       # reset if went airborne mid-window
+                    # a) Hip-down: legs hanging toward ground
+                    hip_posture = 2.0 - abs(obs[4]) - abs(obs[9])
+                    custom_reward += hip_posture * 3.0
+                    # b) Leg extension: straight legs absorb impact better
+                    custom_reward += (4.0 - knee1_angle - knee2_angle) * 2.0
+
+            # ── Landing angle threshold ──────────────────────────────
+            clean_angle = self.CLEAN_LANDING_ANGLE_S5 if self.stage == 5 \
+                          else (self.CLEAN_LANDING_ANGLE_S4 if self.stage == 4 else self.CLEAN_LANDING_ANGLE)
+            crash_angle = self.CRASH_LANDING_ANGLE_S5 if self.stage == 5 else self.CRASH_LANDING_ANGLE
+
+            # 4. KNEE-CRASH CHECK
+            if feet_contact and abs(hull_angle) > crash_angle:
+                if self.stage <= 4:
+                    penalty = -100.0 if self.stage <= 2 else (-150.0 if self.stage == 3 else -200.0)
+                    custom_reward    += penalty
+                    self.stable_steps = 0
+                    terminated        = True
+                else: # Stage 5: do NOT terminate! Let it try to recover.
+                    custom_reward    -= 10.0  # penalty for bad posture
                     self.stable_steps = 0
 
-                # a) Hip-down posture: reward hips angled to point legs toward ground.
-                #    obs[4] = joint[0].angle (hip 1), obs[9] = joint[2].angle (hip 2)
-                #    Positive hip angle means leg sweeps forward/down in landing pose.
-                #    We want both hips extended downward → angle close to -0.5..0 rad.
-                hip1_angle = obs[4]
-                hip2_angle = obs[9]
-                # Reward when both hips near 0 (legs hanging straight down)
-                hip_posture = 2.0 - abs(hip1_angle) - abs(hip2_angle)  # max=2 when both at 0
-                custom_reward += hip_posture * 3.0
-
-                # b) Leg extension reward: discourage tucked knees during descent.
-                #    knee_angle ≈ 0 → extended, ≈ 2 → fully tucked.
-                extension = 4.0 - (knee1_angle + knee2_angle)  # max=4 when fully extended
-                custom_reward += extension * 2.0
-
-            # 4. KNEE-CRASH PENALTY: feet touch but hull is NOT upright
-            clean_angle = self.CLEAN_LANDING_ANGLE_S4 if self.stage == 4 \
-                          else self.CLEAN_LANDING_ANGLE
-
-            if feet_contact and abs(hull_angle) > self.CRASH_LANDING_ANGLE:
-                # Landing on knees / still upside-down = bad
-                crash_penalty = -100.0 if self.stage <= 2 else (-150.0 if self.stage == 3 else -200.0)
-                custom_reward += crash_penalty
-                self.stable_steps = 0   # reset stability counter on crash
-                terminated = True   # treat as failure, reset and retry
-
-            # 5. CLEAN LANDING / STABILITY WINDOW: feet touch AND hull is upright
+            # 5. CLEAN LANDING / STABILITY WINDOW
             elif feet_contact and abs(hull_angle) < clean_angle:
                 if self.stage <= 2:
-                    # Immediate bonus for stages 1-2
-                    uprightness = 1.0 - (abs(hull_angle) / clean_angle)
-                    landing_bonus = 1000.0
-                    custom_reward += landing_bonus * uprightness
-                    self.landed = True
-                    terminated  = True
+                    custom_reward += 1000.0 * (1.0 - (abs(hull_angle) / clean_angle))
+                    self.landed = True;  terminated = True
 
                 elif self.stage == 3:
-                    # Immediate bonus for stage 3
-                    uprightness = 1.0 - (abs(hull_angle) / clean_angle)
-                    landing_bonus = 2000.0
-                    custom_reward += landing_bonus * uprightness
-                    self.landed = True
-                    terminated  = True
+                    custom_reward += 2000.0 * (1.0 - (abs(hull_angle) / clean_angle))
+                    self.landed = True;  terminated = True
 
-                else: # self.stage == 4
-                    # ── Stage 4: STABILITY WINDOW ──────────────────────────
-                    # Agent must hold at least one foot contact + upright for STABILITY_STEPS
-                    # consecutive steps. At the end, both feet must be touching.
+                else: # self.stage in [4, 5]
+                    # Increment stability counter while at least 1 foot has contact and hull is upright
                     self.stable_steps += 1
-
                     uprightness = 1.0 - (abs(hull_angle) / clean_angle)
-                    # Per-step reward for holding the pose
-                    custom_reward += uprightness * 15.0
+                    custom_reward += uprightness * 20.0   # strong reward for standing upright
+                    custom_reward -= abs(ang_vel) * 10.0  # no spinning
+                    custom_reward -= abs(vel_x)   * 8.0   # no sliding
+                    custom_reward -= abs(vel_y)   * 15.0  # no bouncing / hopping (increased)
 
-                    # Must have stable steps AND both feet touching to successfully complete
-                    if self.stable_steps >= self.STABILITY_STEPS and both_feet:
-                        # Held it long enough — award the full bonus
-                        vel_y = obs[3]  # normalised vertical vel (neg = falling)
-                        impact_penalty = max(0.0, -vel_y) * 50.0
-                        custom_reward -= impact_penalty
-                        custom_reward += 3000.0 * uprightness
+                    # Hopping detection: feet down but still bouncing hard → reset counter
+                    if abs(vel_y) > 0.35 and self.stable_steps > 0:
+                        custom_reward -= 50.0
+                        self.stable_steps = 0
+
+                    # Stage 5: reward straight legs and leg spread (triangle/split stance)
+                    if self.stage == 5:
+                        legs_straightness = 4.0 - (knee1_angle + knee2_angle)
+                        custom_reward += legs_straightness * 5.0  # strong incentive to extend legs
+                        
+                        # Encourage split stance (legs spread out like a triangle to increase stability)
+                        # Hip spread: sum of absolute angles rewards both legs angling outward.
+                        # Using the difference was unreliable when both hips are at similar non-zero angles.
+                        hip_spread = abs(hip1_angle) + abs(hip2_angle)
+                        custom_reward += min(hip_spread, 1.2) * 8.0   # reward up to +9.6 for wide stance
+
+                    # Mid-window milestone at half-way to give a shaping signal
+                    half_window = self.STABILITY_STEPS // 2
+                    if self.stable_steps == half_window:
+                        custom_reward += 500.0 * uprightness  # big intermediate reward
+
+                    # COMPLETION: stable for full window with feet on the ground
+                    # Stage 4: requires both feet; Stage 5: only 1 foot needed (more forgiving)
+                    landing_feet = both_feet if self.stage == 4 else feet_contact
+                    if self.stable_steps >= self.STABILITY_STEPS and landing_feet:
+                        # Straight-leg bonus for Stage 5 (reward-only, not gating)
+                        knee_bonus = 0.0
+                        if self.stage == 5:
+                            avg_knee = (knee1_angle + knee2_angle) / 2.0
+                            knee_bonus = max(0.0, (0.7 - avg_knee)) * 500.0  # up to +350 for straight legs
+                        custom_reward -= max(0.0, -vel_y) * 50.0  # impact penalty
+                        custom_reward += 3000.0 * uprightness + knee_bonus
                         self.landed   = True
-                        terminated    = True   # success!
+                        terminated    = True
 
-            # 6. BREAKING STABILITY / RESET (Stage 4 only)
-            elif self.stage == 4:
-                # If we have feet contact but hull angle is not clean (and not crashed),
-                # reset stability. (Airborne resets are handled above in the in_air block)
+            # 6. BREAKING STABILITY / RESET (Stage 4/5 only)
+            elif self.stage in [4, 5]:
+                # Hull angle not clean and not in crash zone: penalise and reset counter
                 if self.stable_steps > 0:
-                    custom_reward -= 30.0
+                    custom_reward -= 20.0  # softer penalty (was 30) so partial progress still counts
                     self.stable_steps = 0
 
-        # ════════════════════════════════════════════════════════════════
-        # STAGE-SPECIFIC extras
-        # ════════════════════════════════════════════════════════════════
+        # Update peak stable steps
+        if self.stable_steps > self.max_stable_steps:
+            self.max_stable_steps = self.stable_steps
+
+        # ══════════════════════════════════════════════════════════════
+        # STAGE-SPECIFIC EXTRAS
+        # ══════════════════════════════════════════════════════════════
         if self.stage == 1:
-            # Nullify the hard -100 fall penalty entirely.
-            # The agent needs to take risks to discover the flip at all.
             if is_falling:
                 custom_reward += 100.0
-
         elif self.stage == 2:
-            # Only soften the fall penalty BEFORE the flip is done.
-            # After the flip it should care about landing, not falling.
             if is_falling and not self.flip_completed:
                 custom_reward += 50.0
+        elif self.stage >= 3:
+            pass  # real gravity, no hand-holding
 
-        elif self.stage == 3:
-            # Real gravity, full physics — no hand-holding.
-            # The agent should already know how to flip; now it must land cleanly.
-            pass
-
-        elif self.stage == 4:
-            # Same as stage 3 — no hand-holding — precision is enforced via
-            # the tighter landing checks and in-air shaping above.
-            pass
-
-        # ── Step limit ──────────────────────────────────────────────────
         if self.step_counter >= self.max_steps:
             truncated = True
 
-        # ── Info ────────────────────────────────────────────────────────
         info["flip_completed"]   = self.flip_completed
         info["landed"]           = self.landed
         info["cumulative_angle"] = self.cumulative_angle
         info["abs_angle_deg"]    = np.degrees(abs_angle)
+        info["max_stable_steps"] = self.max_stable_steps
+        info["knee1_angle"]      = knee1_angle
+        info["knee2_angle"]      = knee2_angle
 
-        total_reward = base_reward + custom_reward
         obs_out = np.append(obs, abs_angle / (2 * np.pi)).astype(np.float32)
-        return obs_out, total_reward, terminated, truncated, info
+        return obs_out, base_reward + custom_reward, terminated, truncated, info
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Standalone training script
 # Run with: python curriculum_flipper.py
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,12 +327,14 @@ if __name__ == "__main__":
     STAGE2_STEPS    = 4_000_000
     STAGE3_STEPS    = 3_000_000
     STAGE4_STEPS    = 3_000_000
+    STAGE5_STEPS    = 1_500_000
     MODELS_DIR      = "models"
     os.makedirs(MODELS_DIR, exist_ok=True)
     STAGE1_SAVE     = os.path.join(MODELS_DIR, "ppo_flipper_stage1")
     STAGE2_SAVE     = os.path.join(MODELS_DIR, "ppo_flipper_stage2")
     STAGE3_SAVE     = os.path.join(MODELS_DIR, "ppo_flipper_stage3")
     STAGE4_SAVE     = os.path.join(MODELS_DIR, "ppo_flipper_stage4")
+    STAGE5_SAVE     = os.path.join(MODELS_DIR, "ppo_flipper_stage5")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -369,27 +342,39 @@ if __name__ == "__main__":
     # ── Callbacks ────────────────────────────────────────────────────────────
 
     class FlipMetricsCallback(BaseCallback):
-        """Logs flip/landing stats to TensorBoard."""
+        """Logs flip/landing success rates and Stage 5 metrics to TensorBoard per episode."""
         def __init__(self, window=200, verbose=0):
             super().__init__(verbose)
             self.window = window
-            self._bufs: dict[str, list] = {k: [] for k in [
-                "flip", "landed", "rot_deg", "ep_len"]}
+            self._flip:        list = []
+            self._landed:      list = []
+            self._rot_deg:     list = []
+            self._stable:      list = []
+            self._knee_bend:   list = []
 
         def _on_step(self) -> bool:
-            for info in self.locals.get("infos", []):
-                if info.get("flip_completed") is None:
-                    continue
-                self._bufs["flip"].append(float(info["flip_completed"]))
-                self._bufs["landed"].append(float(info.get("landed", False)))
-                self._bufs["rot_deg"].append(info.get("abs_angle_deg", 0.0))
-                for buf in self._bufs.values():
-                    if len(buf) > self.window:
-                        buf.pop(0)
-            if self._bufs["flip"]:
-                self.logger.record("flip/success_rate",  float(np.mean(self._bufs["flip"])))
-                self.logger.record("flip/landing_rate",  float(np.mean(self._bufs["landed"])))
-                self.logger.record("flip/max_rot_deg",   float(np.mean(self._bufs["rot_deg"])))
+            dones = self.locals.get("dones")
+            for i, info in enumerate(self.locals.get("infos", [])):
+                if dones is not None and dones[i]:
+                    self._flip.append(float(info.get("flip_completed", False)))
+                    self._landed.append(float(info.get("landed", False)))
+                    self._rot_deg.append(info.get("abs_angle_deg", 0.0))
+                    self._stable.append(float(info.get("max_stable_steps", 0)))
+                    
+                    k1 = info.get("knee1_angle", 0.0)
+                    k2 = info.get("knee2_angle", 0.0)
+                    self._knee_bend.append(float(k1 + k2) / 2.0)
+
+                    for buf in (self._flip, self._landed, self._rot_deg, self._stable, self._knee_bend):
+                        if len(buf) > self.window:
+                            buf.pop(0)
+
+            if self._flip:
+                self.logger.record("flip/success_rate",        np.mean(self._flip))
+                self.logger.record("flip/landing_rate",        np.mean(self._landed))
+                self.logger.record("flip/avg_rotation_deg",    np.mean(self._rot_deg))
+                self.logger.record("flip/avg_max_stable_steps", np.mean(self._stable))
+                self.logger.record("flip/avg_knee_bend",       np.mean(self._knee_bend))
             return True
 
     class RenderCallback(BaseCallback):
@@ -541,10 +526,39 @@ if __name__ == "__main__":
         print(f"Stage 4 model found ({STAGE4_SAVE}.zip) — skipping training.")
 
     # ────────────────────────────────────────────────────────────────────────
+    # STAGE 5 — Landing Stabilization  (gravity = -10.0, relaxed angles)
+    # ────────────────────────────────────────────────────────────────────────
+    stage5_exists = os.path.exists(f"{STAGE5_SAVE}.zip")
+
+    if not stage5_exists:
+        print("\n" + "="*60)
+        print("STAGE 5: Landing Stabilization  (gravity = -10.0, relaxed)")
+        print("="*60)
+        vec_env_s5 = SubprocVecEnv([make_env(stage=5) for _ in range(NUM_ENVS)])
+        model = PPO.load(f"{STAGE4_SAVE}", env=vec_env_s5, device=device,
+                         tensorboard_log="./tb_logs_flipper")
+        model.learning_rate = 5e-5
+        model.ent_coef      = 0.001
+        cbs = CallbackList([
+            FlipMetricsCallback(window=200),
+            RenderCallback(render_freq=100_000, stage=5),
+        ])
+        model.learn(total_timesteps=STAGE5_STEPS, callback=cbs, progress_bar=True,
+                    reset_num_timesteps=False)
+        model.save(STAGE5_SAVE)
+        vec_env_s5.close()
+        print(f"Stage 5 complete. Saved to {STAGE5_SAVE}.zip")
+    else:
+        print(f"Stage 5 model found ({STAGE5_SAVE}.zip) — skipping training.")
+
+    # ────────────────────────────────────────────────────────────────────────
     # TEST: run 5 episodes with the final model rendered
     # ────────────────────────────────────────────────────────────────────────
     import time
-    if os.path.exists(f"{STAGE4_SAVE}.zip"):
+    if os.path.exists(f"{STAGE5_SAVE}.zip"):
+        final_model_path = f"{STAGE5_SAVE}.zip"
+        stage = 5
+    elif os.path.exists(f"{STAGE4_SAVE}.zip"):
         final_model_path = f"{STAGE4_SAVE}.zip"
         stage = 4
     elif os.path.exists(f"{STAGE3_SAVE}.zip"):
